@@ -1,0 +1,4 @@
+coreos.com:
+  network:
+    subnets:
+      172.18.6.0-24

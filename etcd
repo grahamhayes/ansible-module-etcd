@@ -1,6 +1,27 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
-from ansible.module_utils.basic import *
+
+# (c) 2014, Taneli Leppä <taneli@crasman.fi>
+#
+# This file is part of Ansible (sort of)
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+
+ANSIBLE_METADATA = {'status': ['preview'],
+                    'supported_by': 'community',
+                    'version': '0.1'}
 
 DOCUMENTATION = """
 ---
@@ -10,10 +31,11 @@ description:
   - Sets or deletes values in etcd.
   - Parent directories of the key will be created if they do not already exist.
 version_added: "0.1"
-author: Rafe Colton
+author: Graham Hayes
 notes:
   - Supports check mode.
-  - Adapted from https://github.com/devo-ps/ansible-addons
+  - Initially based on https://github.com/devo-ps/ansible-addons
+  - Modified from https://github.com/modcloth-labs/ansible-module-etcd
 requirements:
   - requests >= 2.4
   - python-etcd >= 0.3.2
@@ -24,25 +46,15 @@ options:
       - after this module completes its operations.
     required: true
     choices: [present, absent]
-    default: null
-  host:
+    default: present
+  hosts:
     description:
-      - The etcd host to use
+      - The etcd hosts to use, in a comma separated list of values, including the scheme
     required: false
-    default: 127.0.0.1
-  port:
+    default: https://127.0.0.1:2379
+  values:
     description:
-      - The port to use on the above etcd host
-    required: false
-    default: 4001
-  key:
-    description:
-      - The key in etcd at which to set the value
-    required: true
-    default: null
-  value:
-    description:
-      - The value to be set in etcd
+      - A yaml dict of values to be applied (or removed) on the etcd service
     required: true
     default: null
   allow_redirect:
@@ -58,21 +70,34 @@ options:
 EXAMPLES = """
 # set a value in etcd
 - etcd:
-    state=present
-    host=my-etcd-host.example.com
-    port=4001
-    key=/asdf/foo/bar/baz/gorp
-    value=my-foo-bar-baz-gor-server.prod.example.com
+    state: present
+    hosts: https://10.100.0.101:2379,https://10.100.0.102:2379,https://10.100.0.103:2379
+    ssl_cert: /etc/etcd/client.cert
+    ssl_key: /etc/etcd/client.key
+    ca_cert: /etc/etcd/ca.cert
+    values:
+      coreos.com:
+        network:
+          config: '{ "Network": "172.18.0.0/16", "Backend": {"Type": "host-gw"} }'
+          subnets:
+            172.18.6.0-24: '{"PublicIP":"10.100.0.151","BackendType":"host-gw"}'
 
 # delete a value from etcd
 - etcd:
-    state=absent
-    host=my-etcd-host.example.com
-    port=4001
-    key=/asdf/foo/bar/baz/gorp
+    state: absent
+    hosts: https://10.100.0.101:2379,https://10.100.0.102:2379,https://10.100.0.103:2379
+    ssl_cert: /etc/etcd/client.cert
+    ssl_key: /etc/etcd/client.key
+    ca_cert: /etc/etcd/ca.cert
+    values:
+      coreos.com:
+        network:
+          subnets:
+            172.18.6.0-24
 
-# NOTE: you may wish to use `connection: local` with these tasks
 """
+
+from ansible.module_utils.basic import AnsibleModule
 
 try:
     import etcd
@@ -86,18 +111,55 @@ try:
 except ImportError:
     requests_found = False
 
+from urlparse import urlparse
+import copy
+
+def _extract_host_port_tuples(hosts):
+    host_ports = []
+    scheme = 'https'
+    for host in hosts.split(','):
+        parsed = urlparse(host)
+        result = (parsed.hostname, parsed.port)
+        host_ports.append(result)
+        scheme = parsed.scheme
+    return host_ports, scheme
+
+def _extract_paths(values, output=[], prefix=[]):
+
+    for key, item in values.iteritems():
+
+        if type(item) == dict:
+            new_prefix = copy.deepcopy(prefix)
+            new_prefix.append(key)
+            output = _extract_paths(item, output, new_prefix)
+        else:
+            new_prefix = copy.deepcopy(prefix)
+            new_prefix.append(key)
+            output.append((new_prefix, item))
+
+    return output
 
 def main():
     stack = []
 
     module = AnsibleModule(
         argument_spec=dict(
-            state=dict(required=True, choices=['present', 'absent']),
-            allow_redirect=dict(required=False, default=True),
-            host=dict(required=False, default='127.0.0.1'),
-            key=dict(required=True),
-            port=dict(default=4001),
-            value=dict(required=False, default=None),
+            state=dict(
+                required=False,
+                choices=[
+                    'present', 'absent'
+                ],
+                default='present'
+            ),
+            allow_redirect=dict(
+                required=False,
+                default=True
+            ),
+            hosts=dict(
+                required=False,
+                default='http://127.0.0.1:2379'
+            ),
+            values=dict(required=False, default=None, type='dict'),
         ),
         supports_check_mode=True
     )
@@ -109,20 +171,28 @@ def main():
         module.fail_json(msg="the python requests module is required")
 
     state = module.params['state']
-    target_host = module.params['host']
-    target_port = int(module.params['port'])
+    hosts = module.params['hosts']
+    ssl_cert = module.params['ssl_cert']
+    ssl_key = module.params['ssl_key']
+    ssl_ca_cert = module.params['ssl_ca_cert']
 
-    key = module.params['key']
-    value = module.params['value']
 
-    if state == 'present' and not value:
-        module.fail_json(msg='Value is required with state="present".')
+    hosts, scheme = _extract_host_port_tuples(hosts)
+    values = module.params['values']
+
+    extracted_paths = _extract_paths(values)
 
     kwargs = {
-        'host': target_host,
-        'port': target_port,
-        'allow_redirect': module.params['allow_redirect']
+        "hosts": hosts,
+        "protocol": scheme,
+        "path": extracted_paths,
     }
+
+
+    module.exit_json(**kwargs)
+
+    if state == 'present' and not values:
+        module.fail_json(msg='Values are required with state="present".')
 
     client = etcd.Client(**kwargs)
 
@@ -195,4 +265,5 @@ def main():
 
     module.exit_json(**results)
 
-main()
+if __name__ == '__main__':
+    main()
